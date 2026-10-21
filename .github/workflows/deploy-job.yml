@@ -1,0 +1,119 @@
+name: Deploy job (reusable)
+
+# Called by deploy.yml once per stage. Same steps for development and
+# production, so the two can never drift apart. Secrets come from the
+# GitHub environment that is passed in.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment }}
+
+    # DEMO ONLY: the database server is a Postgres container.
+    # In the real setup this is the client's managed database.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          POSTGRES_DB: app
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+
+      # DEMO ONLY: mock server. Replace with the real droplet later.
+      # The "deploy" user owns /srv/app and nothing else: no sudo.
+      - name: "[MOCK SERVER] Create SSH server with restricted deploy user"
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server postgresql-client
+          sudo systemctl start ssh
+
+          sudo useradd -m -s /bin/bash deploy
+          sudo usermod -p '*' deploy
+          sudo mkdir -p /srv/app/releases
+          sudo chown -R deploy:deploy /srv/app
+
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          sudo mkdir -p /home/deploy/.ssh
+          ssh-keygen -y -f ~/.ssh/deploy_key | sudo tee /home/deploy/.ssh/authorized_keys > /dev/null
+          sudo chown -R deploy:deploy /home/deploy/.ssh
+          sudo chmod 700 /home/deploy/.ssh
+          sudo chmod 600 /home/deploy/.ssh/authorized_keys
+
+          ssh-keyscan localhost >> ~/.ssh/known_hosts
+
+      - name: Check deploy user has no admin rights
+        run: |
+          if ssh -i ~/.ssh/deploy_key deploy@localhost "sudo -n true" 2>/dev/null; then
+            echo "FAIL: deploy user has sudo"
+            exit 1
+          fi
+          echo "OK: deploy user cannot use sudo"
+
+      # Migrations run in the pipeline, never by hand.
+      - name: Run database migrations
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: postgres
+          PGDATABASE: app
+          PGPASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          psql -v ON_ERROR_STOP=1 -c "CREATE TABLE IF NOT EXISTS schema_migrations (filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ DEFAULT now());"
+          for f in migrations/*.sql; do
+            name=$(basename "$f")
+            done_already=$(psql -tA -c "SELECT 1 FROM schema_migrations WHERE filename = '$name'")
+            if [ "$done_already" = "1" ]; then
+              echo "skip  $name (already applied)"
+              continue
+            fi
+            echo "apply $name"
+            psql -v ON_ERROR_STOP=1 --single-transaction -f "$f" -c "INSERT INTO schema_migrations (filename) VALUES ('$name')"
+          done
+          echo "--- tables now in the database ---"
+          psql -c "\dt"
+
+      - name: Upload release to server
+        run: scp -i ~/.ssh/deploy_key release.tar.gz deploy@localhost:/srv/app/
+
+      - name: Activate release
+        run: |
+          ssh -i ~/.ssh/deploy_key deploy@localhost bash -s "$GITHUB_SHA" <<'EOF'
+          set -euo pipefail
+          REL=/srv/app/releases/$1
+          mkdir -p "$REL"
+          tar -xzf /srv/app/release.tar.gz -C "$REL"
+          ln -sfn "$REL" /srv/app/current
+          echo "Deployed commit $1"
+          ls -la /srv/app/current/
+          EOF
+
+      - name: Verify deployment
+        run: |
+          ssh -i ~/.ssh/deploy_key deploy@localhost "test -f /srv/app/current/src/index.js && echo 'Release is live in ${{ inputs.environment }}'"
